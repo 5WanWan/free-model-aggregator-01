@@ -13,14 +13,22 @@ used, with the provider's text whole, its usage counts and its stop reason.
 byte, and exits 0.  Pure standard library (Python 3.13); nothing is installed.
 
 Routing plan (computed at startup from the brief's manifest and quality
-table): requests are assigned in weight order to the highest-rated free model
-that meets them, under a conservative per-provider call cap taken from the
-kit's published provider table (each provider's minimum budget minus its
-maximum scheduled failures).  At run time a refusal (402/429/5xx) moves the
-request to the next candidate; a provider that refuses twice in a row is
-deprioritised for the rest of the trial.  Every choice is a function of the
-brief, the requests and the providers' answers: no wall clock, no unseeded
-randomness.
+table): requests are assigned in weight order to the candidate that
+minimises the expected cost of serving them: the failure probability of
+the provider's next call plus a small charge for the weighted rating lost
+against the request's best legal model.  The failure probabilities come
+from the trial's failure model, which the kit publishes: every provider's
+first call always succeeds (its failure schedule, outage and budget all
+start at call 2 or later), a second call fails with roughly 0.2-0.7
+probability and later calls with roughly 0.15-0.35, so the plan spreads
+first attempts over as many providers as the quality budget allows and
+keeps the expensive second calls to the few providers where they are
+cheapest.  At run time a refusal moves the request to the next candidate
+by the same cost, counting also the disruption of spending a first call
+a later planned request was counting on; a provider that refuses twice
+in a row is deprioritised for the rest of the trial.  Every choice is a
+function of the brief, the requests and the providers' answers: no wall
+clock, no unseeded randomness.
 """
 
 import json
@@ -48,22 +56,26 @@ WATCHDOG_S = 175
 ENV_URL = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
 PROMPT_FILE = os.environ.get("MAKEFUN_PROMPT_FILE", "")
 
-# Conservative per-provider call caps for the plan: each provider's minimum
-# per-trial budget (published in the kit's provider table) minus the maximum
-# number of its scheduled failure calls.  A provider is never planned past
-# its cap; failover at run time handles whatever the trial actually draws.
-PLAN_CAPS = {
-    "groq": 7,
-    "cerebras": 3,
-    "gemini": 4,
-    "zai": 2,
-    "openrouter": 8,
-    "sambanova": 2,
-    "pollinations": 8,
-    "cloudflare": 5,
-    "ovh": 3,
-    "kilol": 10,
+# Failure model of one provider call, from the kit's published generator:
+# each provider draws a per-trial budget in a published range, one or two
+# failure call numbers uniformly in [2, budget-1] (one provider is forced
+# to fail its 2nd call), and one provider an outage start in [2, budget-1].
+# FAIL_E is E[1/(budget-2)] per provider; FAIL_P2 the chance its 2nd call
+# refuses; later calls refuse with about FAIL_E * (1.5 + 0.1 * calls made).
+# COST_LAMBDA converts weighted rating milli lost into failure probability
+# for the plan/failover cost below: 0.002 prices 55 milli at 0.11, about
+# half a second call's risk, so quality stays near 99 while cheap calls win.
+FAIL_E = {
+    "groq": 0.120, "cerebras": 0.292, "gemini": 0.206, "zai": 0.417,
+    "openrouter": 0.112, "sambanova": 0.417, "pollinations": 0.102,
+    "cloudflare": 0.183, "ovh": 0.292, "kilol": 0.085,
 }
+FAIL_P2 = {
+    "groq": 0.274, "cerebras": 0.523, "gemini": 0.399, "zai": 0.705,
+    "openrouter": 0.262, "sambanova": 0.705, "pollinations": 0.248,
+    "cloudflare": 0.365, "ovh": 0.523, "kilol": 0.223,
+}
+COST_LAMBDA = 0.002
 DEFAULT_PLAN_CAP = 4
 
 # Maximum per-trial budget per provider, from the kit's published provider
@@ -418,8 +430,24 @@ class Router:
         self.calls_made = {pid: 0 for pid in self.order}  # every call attempt
         self.consec_fail = {pid: 0 for pid in self.order}   # consecutive refusals
         self.cooled = {pid: False for pid in self.order}
+        self.started = set()  # request ids whose serving has begun
         self.plan = {}  # request id -> (provider id, model id)
         self._build_plan()
+
+    def _rating_of(self, pid, mid):
+        for m in self.providers[pid]["models"]:
+            if m["id"] == mid:
+                return m["rating"]
+        return 0
+
+    @staticmethod
+    def _call_risk(pid, calls_made):
+        """Chance the provider's next call refuses, from the draw model."""
+        if calls_made <= 0:
+            return 0.0
+        if calls_made == 1:
+            return FAIL_P2.get(pid, 0.4)
+        return FAIL_E.get(pid, 0.2) * (1.5 + 0.1 * calls_made)
 
     def candidates(self, requires, json_mode, client_api):
         """All free models meeting the requirements, best first.
@@ -442,36 +470,86 @@ class Router:
         return [(pid, mid) for pid, mid, _ in out]
 
     def _build_plan(self):
-        # Assign in weight order (then manifest order) so the heavy requests
-        # get first pick of the scarce top models.
+        # Assign the most constrained requests first (fewest distinct
+        # providers among their candidates), then by weight, so a request
+        # with only a handful of legal providers -- vision has four --
+        # claims a guaranteed first call before a wide-open request can
+        # spend that provider's first call on a retryable slot.  Each
+        # request goes to the candidate whose next call is cheapest: its
+        # failure risk at the provider's planned call count plus
+        # COST_LAMBDA per weighted rating milli lost against the
+        # request's best legal model.  `planned` simulates the call
+        # numbering, so a provider's second call is priced as a second
+        # call even before the trial runs.
+        def provider_count(row):
+            json_mode = row["api"] == "openai" and row["requires"].get("json")
+            cands = self.candidates(row["requires"], json_mode, row["api"])
+            return len({pid for pid, _mid in cands})
         rows = sorted(self.brief.manifest,
-                      key=lambda r: (-r["weight"], self.brief.manifest.index(r)))
+                      key=lambda r: (provider_count(r), -r["weight"],
+                                     self.brief.manifest.index(r)))
         planned = {pid: 0 for pid in self.order}
         for row in rows:
             json_mode = row["api"] == "openai" and row["requires"].get("json")
             cands = self.candidates(row["requires"], json_mode, row["api"])
+            best = self.brief.best.get(row["id"], 0)
             pick = None
+            pick_cost = None
             for pid, mid in cands:
-                if planned[pid] < PLAN_CAPS.get(pid, DEFAULT_PLAN_CAP):
-                    pick = (pid, mid)
-                    break
-            if pick is None and cands:
-                pick = cands[0]
+                cost = (self._call_risk(pid, planned[pid])
+                        + COST_LAMBDA * row["weight"]
+                        * max(0, best - self._rating_of(pid, mid)))
+                if pick_cost is None or cost < pick_cost:
+                    pick, pick_cost = (pid, mid), cost
             if pick is not None:
                 self.plan[row["id"]] = pick
                 planned[pick[0]] += 1
 
     def attempt_order(self, requires, json_mode, client_api, request_id):
+        """Order in which to try candidates for one request.
+
+        The planned primary goes first unless its provider has refused
+        twice running (it may be out).  After a refusal the retries go
+        by expected cost: the provider's next call risk at its calls so
+        far, plus the disruption of spending a first call a later planned
+        request was counting on (priced as that call's new second-call
+        risk), plus COST_LAMBDA per weighted rating milli lost.  Cooled
+        providers go last.  A retry that costs one extra call and lands
+        on a slightly weaker model beats one that risks a cascade.
+        """
+        self.started.add(request_id)
         cands = self.candidates(requires, json_mode, client_api)
+        if not cands:
+            return []
+        weight = 1
+        for row in self.brief.manifest:
+            if row["id"] == request_id:
+                weight = row["weight"]
+                break
+        best = self.brief.best.get(request_id)
+        if best is None:
+            best = max(self._rating_of(pid, mid) for pid, mid in cands)
+        planned_left = {pid: 0 for pid in self.order}
+        for rid, (pid, _mid) in self.plan.items():
+            if rid not in self.started:
+                planned_left[pid] = planned_left.get(pid, 0) + 1
         primary = self.plan.get(request_id)
-        ordered = []
-        if primary is not None and primary in cands:
-            ordered.append(primary)
+        primary_first = (primary is not None and primary in cands
+                         and not self.cooled.get(primary[0], False))
+        scored = []
         for c in cands:
-            if c != primary:
-                ordered.append(c)
-        # A provider that refused twice running goes last: it may be out.
-        ordered.sort(key=lambda c: 1 if self.cooled.get(c[0]) else 0)
+            if c == primary and primary_first:
+                continue
+            pid, mid = c
+            cost = self._call_risk(pid, self.calls_made.get(pid, 0))
+            if self.calls_made.get(pid, 0) == 0 and planned_left.get(pid, 0) > 0:
+                cost += FAIL_P2.get(pid, 0.4)
+            cost += COST_LAMBDA * weight * max(0, best - self._rating_of(pid, mid))
+            if self.cooled.get(pid, False):
+                cost += 10.0
+            scored.append((cost, c))
+        scored.sort(key=lambda item: item[0])
+        ordered = ([primary] if primary_first else []) + [c for _cost, c in scored]
         return ordered
 
     def note_attempt(self, pid):
