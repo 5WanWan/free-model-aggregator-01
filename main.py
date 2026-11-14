@@ -13,22 +13,17 @@ used, with the provider's text whole, its usage counts and its stop reason.
 byte, and exits 0.  Pure standard library (Python 3.13); nothing is installed.
 
 Routing plan (computed at startup from the brief's manifest and quality
-table): requests are assigned in weight order to the candidate that
-minimises the expected cost of serving them: the failure probability of
-the provider's next call plus a small charge for the weighted rating lost
-against the request's best legal model.  The failure probabilities come
-from the trial's failure model, which the kit publishes: every provider's
-first call always succeeds (its failure schedule, outage and budget all
-start at call 2 or later), a second call fails with roughly 0.2-0.7
-probability and later calls with roughly 0.15-0.35, so the plan spreads
-first attempts over as many providers as the quality budget allows and
-keeps the expensive second calls to the few providers where they are
-cheapest.  At run time a refusal moves the request to the next candidate
-by the same cost, counting also the disruption of spending a first call
-a later planned request was counting on; a provider that refuses twice
-in a row is deprioritised for the rest of the trial.  Every choice is a
-function of the brief, the requests and the providers' answers: no wall
-clock, no unseeded randomness.
+table): v6 assigns requests by min-cost flow under a fixed per-provider
+call cap (PLAN_CAPS): openrouter 7, kilol 5, gemini 2, every other
+provider 1 except zai 0.  Those caps are the count vector that maximises
+the chance of zero failed calls -- a 20-call trial -- under the kit's
+published failure model, while the assignment itself minimises the
+weighted rating lost.  At run time a refusal moves the request to the
+next candidate by expected cost, counting also the disruption of
+spending a first call a later planned request was counting on; a
+provider that refuses twice in a row is deprioritised for the rest of
+the trial.  Every choice is a function of the brief, the requests and
+the providers' answers: no wall clock, no unseeded randomness.
 """
 
 import json
@@ -398,8 +393,115 @@ def build_catalog(brief, probes):
 
 
 # ---------------------------------------------------------------------------
-# Routing: candidate lists and the weight-ordered plan
-# ---------------------------------------------------------------------------
+# v6 plan (2026-11-14): the primary assignment is a min-loss assignment
+# under a fixed per-provider call cap, PLAN_CAPS.  The caps are the count
+# vector that maximises P(zero failed calls) under the kit's published
+# failure model -- one provider per trial is forced to fail its 2nd call,
+# every provider draws 1-2 failure call numbers in [2, budget-1], one
+# provider has an outage -- subject to the plan's rating loss staying
+# near the quality-99 budget.  Loading openrouter 11x (v5) can never hit
+# 20 calls: its failure numbers are all inside calls 2..11, so at least
+# one always fails.  Spreading 2 calls over all ten providers is worse:
+# the forced 2nd-call failure then hits a provider that certainly has
+# two calls, so P(20) = 0 exactly.  The optimum concentrates the extra
+# calls on the two biggest-budget providers while keeping the rest at
+# one call each: openrouter 7, kilol 5, gemini 2, every other provider
+# 1 except zai 0.  The assignment itself is computed live from the
+# brief by min-cost flow (see _min_cost_plan), so the plan is a function
+# of the brief, never of the wall clock or unseeded randomness; the caps
+# are the only offline-derived constant, like FAIL_E/FAIL_P2 above.
+PLAN_CAPS = {
+    "openrouter": 7, "kilol": 5, "gemini": 2, "zai": 0, "groq": 1,
+    "cerebras": 1, "sambanova": 1, "pollinations": 1, "cloudflare": 1,
+    "ovh": 1,
+}
+
+
+def _min_cost_plan(router, caps):
+    """Min total weighted rating loss assignment under per-provider caps.
+
+    Transportation problem: 20 requests -> providers with capacities
+    caps[pid]; the cost of serving request r on provider p is
+    weight(r) * (best(r) - rating of p's best legal model for r).
+    Solved exactly by successive shortest augmenting paths (the graph
+    is tiny).  Returns {request id: (provider id, model id)} or None
+    when no feasible assignment exists.
+    """
+    brief = router.brief
+    rows = brief.manifest
+    n_req = len(rows)
+    providers = [pid for pid in router.order if caps.get(pid, 0) > 0]
+    n_prov = len(providers)
+    if n_prov == 0 or sum(caps.get(pid, 0) for pid in providers) < n_req:
+        return None
+    n_nodes = 1 + n_req + n_prov + 1
+    src, snk = 0, n_nodes - 1
+    graph = [[] for _ in range(n_nodes)]
+
+    def add_edge(u, v, cap, cost):
+        graph[u].append([v, cap, cost, len(graph[v])])
+        graph[v].append([u, 0, -cost, len(graph[u]) - 1])
+
+    for i, row in enumerate(rows):
+        add_edge(src, 1 + i, 1, 0)
+        json_mode = row["api"] == "openai" and bool(row["requires"].get("json"))
+        per_pid = {}
+        for pid, mid in router.candidates(row["requires"], json_mode,
+                                          row["api"]):
+            if pid not in per_pid:
+                per_pid[pid] = mid
+        best = brief.best.get(row["id"], 0)
+        for pid, mid in per_pid.items():
+            if pid not in providers:
+                continue
+            loss = row["weight"] * max(
+                0, best - router._rating_of(pid, mid))
+            add_edge(1 + i, 1 + n_req + providers.index(pid), 1, loss)
+    for j, pid in enumerate(providers):
+        add_edge(1 + n_req + j, snk, caps[pid], 0)
+    inf = float("inf")
+    flow = 0
+    while flow < n_req:
+        dist = [inf] * n_nodes
+        prev = [None] * n_nodes
+        dist[src] = 0
+        for _ in range(n_nodes):
+            updated = False
+            for u in range(n_nodes):
+                if dist[u] == inf:
+                    continue
+                for ei, e in enumerate(graph[u]):
+                    v, cap, cost, _rev = e
+                    if cap > 0 and dist[v] > dist[u] + cost:
+                        dist[v] = dist[u] + cost
+                        prev[v] = (u, ei)
+                        updated = True
+            if not updated:
+                break
+        if dist[snk] == inf:
+            return None
+        v = snk
+        while v != src:
+            u, ei = prev[v]
+            e = graph[u][ei]
+            e[1] -= 1
+            graph[e[0]][e[3]][1] += 1
+            v = u
+        flow += 1
+    plan = {}
+    for i, row in enumerate(rows):
+        for e in graph[1 + i]:
+            v, _cap, _cost, rev = e
+            if 1 + n_req <= v < 1 + n_req + n_prov and graph[v][rev][1] == 1:
+                pid = providers[v - (1 + n_req)]
+                json_mode = row["api"] == "openai" and bool(
+                    row["requires"].get("json"))
+                for p, m in router.candidates(row["requires"], json_mode,
+                                              row["api"]):
+                    if p == pid:
+                        plan[row["id"]] = (p, m)
+                        break
+    return plan if len(plan) == n_req else None
 
 class Router:
     def __init__(self, brief, probes):
@@ -470,6 +572,16 @@ class Router:
         return [(pid, mid) for pid, mid, _ in out]
 
     def _build_plan(self):
+        # v6: min-loss assignment under PLAN_CAPS (see above).  Falls back
+        # to the v5 greedy below when a capped provider is missing from
+        # the probes or no feasible assignment exists.
+        capped = _min_cost_plan(self, PLAN_CAPS)
+        if capped is not None:
+            self.plan = capped
+            return
+        self._build_plan_greedy()
+
+    def _build_plan_greedy(self):
         # Assign the most constrained requests first (fewest distinct
         # providers among their candidates), then by weight, so a request
         # with only a handful of legal providers -- vision has four --
